@@ -1179,6 +1179,12 @@ func (n *Network) CreateEndpoint(ctx context.Context, name string, options ...En
 }
 
 func (n *Network) createEndpoint(ctx context.Context, name string, options ...EndpointOption) (*Endpoint, error) {
+	ctx, span := otel.Tracer("").Start(ctx, "libnetwork.Network.createEndpoint", trace.WithAttributes(
+		attribute.String("network.name", n.Name()),
+		attribute.String("endpoint.name", name),
+	))
+	defer span.End()
+
 	var err error
 
 	ep := &Endpoint{name: name, generic: make(map[string]any), iface: &EndpointInterface{}}

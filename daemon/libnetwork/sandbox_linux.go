@@ -10,6 +10,9 @@ import (
 	"github.com/moby/moby/v2/daemon/libnetwork/netutils"
 	"github.com/moby/moby/v2/daemon/libnetwork/osl"
 	"github.com/moby/moby/v2/daemon/libnetwork/types"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Linux-specific container configuration flags.
@@ -141,6 +144,12 @@ func (sb *Sandbox) ExecFunc(f func()) error {
 
 // SetKey updates the Sandbox Key.
 func (sb *Sandbox) SetKey(ctx context.Context, basePath string) error {
+	ctx, span := otel.Tracer("").Start(ctx, "libnetwork.Sandbox.SetKey", trace.WithAttributes(
+		attribute.String("container.ID", sb.ContainerID()),
+		attribute.String("basePath", basePath),
+	))
+	defer span.End()
+
 	start := time.Now()
 	defer func() {
 		log.G(ctx).Debugf("sandbox set key processing took %s for container %s", time.Since(start), sb.ContainerID())

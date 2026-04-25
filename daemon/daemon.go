@@ -519,7 +519,7 @@ func (daemon *Daemon) restore(ctx context.Context, cfg *configStore, containers 
 
 				c.ResetRestartManager(false)
 				if !c.HostConfig.NetworkMode.IsContainer() && c.State.IsRunning() {
-					options, err := buildSandboxOptions(&cfg.Config, c)
+					options, err := buildSandboxOptions(context.TODO(), &cfg.Config, c)
 					if err != nil {
 						logger(c).WithError(err).Warn("failed to build sandbox option to restore container")
 					}

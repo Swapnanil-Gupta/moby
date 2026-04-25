@@ -37,7 +37,10 @@ import (
 
 const errSetupNetworking = "failed to set up container networking"
 
-func buildSandboxOptions(cfg *config.Config, ctr *container.Container) ([]libnetwork.SandboxOption, error) {
+func buildSandboxOptions(ctx context.Context, cfg *config.Config, ctr *container.Container) ([]libnetwork.SandboxOption, error) {
+	_, span := otel.Tracer("").Start(ctx, "daemon.buildSandboxOptions")
+	defer span.End()
+
 	var sboxOptions []libnetwork.SandboxOption
 	sboxOptions = append(sboxOptions, libnetwork.OptionHostname(ctr.Config.Hostname), libnetwork.OptionDomainname(ctr.Config.Domainname))
 
@@ -252,7 +255,7 @@ func (daemon *Daemon) updateNetwork(cfg *config.Config, ctr *container.Container
 		return nil
 	}
 
-	sbOptions, err := buildSandboxOptions(cfg, ctr)
+	sbOptions, err := buildSandboxOptions(context.TODO(), cfg, ctr)
 	if err != nil {
 		return fmt.Errorf("Update network failed: %v", err)
 	}
@@ -425,6 +428,13 @@ func (daemon *Daemon) updateContainerNetworkSettings(ctr *container.Container, e
 }
 
 func (daemon *Daemon) allocateNetwork(ctx context.Context, cfg *config.Config, ctr *container.Container) (retErr error) {
+	ctx, span := otel.Tracer("").Start(ctx, "daemon.allocateNetwork", trace.WithAttributes(
+		attribute.String("container.ID", ctr.ID),
+	))
+	defer func() {
+		span.End()
+	}()
+
 	start := time.Now()
 
 	// An intermediate map is necessary because "connectToNetwork" modifies "container.NetworkSettings.Networks"
@@ -448,6 +458,14 @@ func (daemon *Daemon) allocateNetwork(ctx context.Context, cfg *config.Config, c
 // If it creates a new libnetwork.Sandbox it's returned as newSandbox, for
 // the caller to Delete() if the container setup fails later in the process.
 func (daemon *Daemon) initializeNetworking(ctx context.Context, cfg *config.Config, ctr *container.Container) (newSandbox *libnetwork.Sandbox, retErr error) {
+	ctx, span := otel.Tracer("").Start(ctx, "daemon.initializeNetworking", trace.WithAttributes(
+		attribute.String("container.ID", ctr.ID),
+		attribute.String("networkMode", string(ctr.HostConfig.NetworkMode)),
+	))
+	defer func() {
+		span.End()
+	}()
+
 	if daemon.netController == nil || ctr.Config.NetworkDisabled {
 		return nil, nil
 	}
@@ -484,7 +502,7 @@ func (daemon *Daemon) initializeNetworking(ctx context.Context, cfg *config.Conf
 
 	daemon.updateContainerNetworkSettings(ctr, nil)
 
-	sbOptions, err := buildSandboxOptions(cfg, ctr)
+	sbOptions, err := buildSandboxOptions(ctx, cfg, ctr)
 	if err != nil {
 		return nil, err
 	}

@@ -7,9 +7,13 @@ import (
 	"github.com/moby/moby/v2/daemon/config"
 	"github.com/moby/moby/v2/daemon/container"
 	"github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
+	"github.com/moby/moby/v2/daemon/internal/otelutil"
 	"github.com/moby/moby/v2/daemon/pkg/oci"
 	"github.com/moby/moby/v2/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // initializeCreatedTask performs any initialization that needs to be done to
@@ -20,7 +24,15 @@ func (daemon *Daemon) initializeCreatedTask(
 	tsk types.Task,
 	ctr *container.Container,
 	spec *specs.Spec,
-) error {
+) (retErr error) {
+	ctx, span := otel.Tracer("").Start(ctx, "daemon.initializeCreatedTask", trace.WithAttributes(
+		attribute.String("container.ID", ctr.ID),
+	))
+	defer func() {
+		otelutil.RecordStatus(span, retErr)
+		span.End()
+	}()
+
 	if ctr.Config.NetworkDisabled {
 		return nil
 	}
