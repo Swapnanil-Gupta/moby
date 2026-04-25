@@ -1101,6 +1101,17 @@ func (c *containerRouter) postContainersAttach(ctx context.Context, w http.Respo
 		return err
 	}
 	containerName := vars["name"]
+
+	ctx, span := otel.Tracer("").Start(ctx, "containerRouter.postContainersAttach", trace.WithAttributes(
+		attribute.String("container", containerName),
+		attribute.Bool("stdin", httputils.BoolValue(r, "stdin")),
+		attribute.Bool("stdout", httputils.BoolValue(r, "stdout")),
+		attribute.Bool("stderr", httputils.BoolValue(r, "stderr")),
+		attribute.Bool("logs", httputils.BoolValue(r, "logs")),
+		attribute.Bool("stream", httputils.BoolValue(r, "stream")),
+	))
+	defer span.End()
+
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		return errdefs.InvalidParameter(errors.Errorf("error attaching to container %s, hijack connection missing", containerName))

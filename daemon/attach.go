@@ -17,10 +17,23 @@ import (
 	"github.com/moby/moby/v2/errdefs"
 	"github.com/moby/term"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ContainerAttach attaches to logs according to the config passed in. See ContainerAttachConfig.
 func (daemon *Daemon) ContainerAttach(prefixOrName string, req *backend.ContainerAttachConfig) error {
+	ctx, span := otel.Tracer("").Start(context.Background(), "daemon.ContainerAttach", trace.WithAttributes(
+		attribute.String("container", prefixOrName),
+		attribute.Bool("stdin", req.UseStdin),
+		attribute.Bool("stdout", req.UseStdout),
+		attribute.Bool("stderr", req.UseStderr),
+		attribute.Bool("logs", req.Logs),
+		attribute.Bool("stream", req.Stream),
+	))
+	defer span.End()
+
 	keys := []byte{}
 	var err error
 	if req.DetachKeys != "" {
@@ -89,7 +102,7 @@ func (daemon *Daemon) ContainerAttach(prefixOrName string, req *backend.Containe
 		cfg.Stderr = errStream
 	}
 
-	if err := daemon.containerAttach(ctr, &cfg, req.Logs, req.Stream); err != nil {
+	if err := daemon.containerAttach(ctx, ctr, &cfg, req.Logs, req.Stream); err != nil {
 		_, _ = fmt.Fprintln(outStream, "Error attaching:", err)
 	}
 	return nil
@@ -120,10 +133,17 @@ func (daemon *Daemon) ContainerAttachRaw(prefixOrName string, stdin io.ReadClose
 		cfg.Stderr = stderr
 	}
 
-	return daemon.containerAttach(ctr, &cfg, false, doStream)
+	return daemon.containerAttach(context.Background(), ctr, &cfg, false, doStream)
 }
 
-func (daemon *Daemon) containerAttach(ctr *container.Container, cfg *stream.AttachConfig, enableLogs, doStream bool) error {
+func (daemon *Daemon) containerAttach(ctx context.Context, ctr *container.Container, cfg *stream.AttachConfig, enableLogs, doStream bool) error {
+	ctx, span := otel.Tracer("").Start(ctx, "daemon.containerAttach", trace.WithAttributes(
+		attribute.String("container.ID", ctr.ID),
+		attribute.Bool("enableLogs", enableLogs),
+		attribute.Bool("doStream", doStream),
+	))
+	defer span.End()
+
 	if enableLogs {
 		logDriver, logCreated, err := daemon.getLogger(ctr)
 		if err != nil {
@@ -160,13 +180,15 @@ func (daemon *Daemon) containerAttach(ctr *container.Container, cfg *stream.Atta
 					cfg.Stderr.Write(msg.Line)
 				}
 			case err := <-logWatcher.Err:
-				log.G(context.TODO()).WithFields(log.Fields{
+				log.G(ctx).WithFields(log.Fields{
 					"error":     err,
 					"container": ctr.ID,
 				}).Error("Error streaming logs")
 				break LogLoop
 			}
 		}
+
+		span.AddEvent("logs.replay.done")
 	}
 
 	daemon.LogContainerEvent(ctr, events.ActionAttach)
@@ -174,6 +196,8 @@ func (daemon *Daemon) containerAttach(ctr *container.Container, cfg *stream.Atta
 	if !doStream {
 		return nil
 	}
+
+	span.AddEvent("stream.copy.begin")
 
 	if cfg.Stdin != nil {
 		r, w := io.Pipe()
@@ -199,8 +223,11 @@ func (daemon *Daemon) containerAttach(ctr *container.Container, cfg *stream.Atta
 		}()
 	}
 
-	ctx := ctr.AttachContext()
+	ctx = ctr.AttachContext()
 	err := <-ctr.StreamConfig.CopyStreams(ctx, cfg)
+
+	span.AddEvent("stream.copy.done")
+
 	if err != nil {
 		var ierr term.EscapeError
 		if errors.Is(err, context.Canceled) || errors.As(err, &ierr) {
