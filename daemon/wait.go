@@ -5,6 +5,9 @@ import (
 
 	containertypes "github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/v2/daemon/container"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ContainerWait waits until the given container is in a certain state
@@ -15,6 +18,12 @@ import (
 // context timeout or cancellation). On a successful wait, the exit code of the
 // container is returned in the status with a non-nil Err() value.
 func (daemon *Daemon) ContainerWait(ctx context.Context, name string, condition containertypes.WaitCondition) (<-chan container.StateStatus, error) {
+	ctx, span := otel.Tracer("").Start(ctx, "daemon.ContainerWait", trace.WithAttributes(
+		attribute.String("container", name),
+		attribute.String("condition", string(condition)),
+	))
+	defer span.End()
+
 	cntr, err := daemon.GetContainer(name)
 	if err != nil {
 		return nil, err

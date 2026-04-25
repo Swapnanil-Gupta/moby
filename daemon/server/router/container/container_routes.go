@@ -34,6 +34,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/websocket"
 )
 
@@ -377,6 +379,11 @@ func (c *containerRouter) postContainersUnpause(ctx context.Context, w http.Resp
 }
 
 func (c *containerRouter) postContainersWait(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
+	ctx, span := otel.Tracer("").Start(ctx, "containerRouter.postContainersWait", trace.WithAttributes(
+		attribute.String("container", vars["name"]),
+	))
+	defer span.End()
+
 	// Behavior changed in version 1.30 to handle wait condition and to
 	// return headers immediately.
 	version := httputils.VersionFromContext(ctx)
@@ -404,10 +411,16 @@ func (c *containerRouter) postContainersWait(ctx context.Context, w http.Respons
 		}
 	}
 
+	span.AddEvent("wait.setup.done", trace.WithAttributes(
+		attribute.String("condition", string(waitCondition)),
+	))
+
 	waitC, err := c.backend.ContainerWait(ctx, vars["name"], waitCondition)
 	if err != nil {
 		return err
 	}
+
+	span.AddEvent("wait.registered")
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -421,6 +434,10 @@ func (c *containerRouter) postContainersWait(ctx context.Context, w http.Respons
 
 	// Block on the result of the wait operation.
 	status := <-waitC
+
+	span.AddEvent("wait.completed", trace.WithAttributes(
+		attribute.Int("exitCode", status.ExitCode()),
+	))
 
 	// With API < 1.34, wait on WaitConditionRemoved did not return
 	// in case container removal failed. The only way to report an

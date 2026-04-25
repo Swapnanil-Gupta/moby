@@ -10,6 +10,9 @@ import (
 	"github.com/docker/go-units"
 	"github.com/moby/moby/api/types/container"
 	libcontainerdtypes "github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // State holds the current container state, and has methods to get and
@@ -154,6 +157,11 @@ func (s *State) State() container.ContainerState {
 // otherwise, the results Err() method will return an error indicating why the
 // wait operation failed.
 func (s *State) Wait(ctx context.Context, condition container.WaitCondition) <-chan StateStatus {
+	_, span := otel.Tracer("").Start(ctx, "container.State.Wait", trace.WithAttributes(
+		attribute.String("condition", string(condition)),
+	))
+	defer span.End()
+
 	s.Lock()
 	defer s.Unlock()
 
@@ -161,6 +169,9 @@ func (s *State) Wait(ctx context.Context, condition container.WaitCondition) <-c
 	resultC := make(chan StateStatus, 1)
 
 	if s.conditionAlreadyMet(condition) {
+		span.AddEvent("condition.already_met", trace.WithAttributes(
+			attribute.Int("exitCode", s.ExitCode),
+		))
 		resultC <- StateStatus{
 			exitCode: s.ExitCode,
 			err:      s.Err(),
@@ -168,6 +179,8 @@ func (s *State) Wait(ctx context.Context, condition container.WaitCondition) <-c
 
 		return resultC
 	}
+
+	span.AddEvent("waiter.registered")
 
 	waitC := make(chan StateStatus, 1)
 
@@ -421,10 +434,19 @@ func (s *State) notifyAndClear(waiters *[]chan<- StateStatus) {
 		err:      s.Err(),
 	}
 
+	nWaiters := len(*waiters)
 	for _, c := range *waiters {
 		c <- result
 	}
 	*waiters = nil
+
+	if nWaiters > 0 {
+		_, span := otel.Tracer("").Start(context.Background(), "container.State.notifyWaiters", trace.WithAttributes(
+			attribute.Int("waiters.count", nWaiters),
+			attribute.Int("exitCode", s.ExitCode),
+		))
+		span.End()
+	}
 }
 
 // C8dContainer returns a reference to the libcontainerd Container object for
