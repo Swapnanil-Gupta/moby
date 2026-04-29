@@ -1002,24 +1002,32 @@ func (daemon *Daemon) getNetworkedContainer(containerID, connectedContainerPrefi
 
 func (daemon *Daemon) releaseNetwork(ctx context.Context, ctr *container.Container) {
 	ctx = context.WithoutCancel(ctx)
+	_, span := otel.Tracer("").Start(ctx, "daemon.releaseNetwork", trace.WithAttributes(
+		attribute.String("container.ID", ctr.ID),
+	))
+	defer span.End()
 
 	start := time.Now()
 	// If live-restore is enabled, the daemon cleans up dead containers when it starts up. In that case, the
 	// netController hasn't been initialized yet, and so we can't proceed.
 	if daemon.netController == nil {
+		span.AddEvent("skipped.no_netController")
 		return
 	}
 	// If the container uses the network namespace of another container, it doesn't own it -- nothing to do here.
 	if ctr.HostConfig.NetworkMode.IsContainer() {
+		span.AddEvent("skipped.shared_netns")
 		return
 	}
 	if ctr.NetworkSettings == nil {
+		span.AddEvent("skipped.no_network_settings")
 		return
 	}
 
 	ctr.NetworkSettings.Ports = nil
 	sid := ctr.NetworkSettings.SandboxID
 	if sid == "" {
+		span.AddEvent("skipped.no_sandbox")
 		return
 	}
 
@@ -1039,18 +1047,28 @@ func (daemon *Daemon) releaseNetwork(ctx context.Context, ctr *container.Contain
 		cleanOperationalData(epSettings)
 	}
 
-	sb, err := daemon.netController.SandboxByID(sid)
-	if err != nil {
-		log.G(ctx).Warnf("error locating sandbox id %s: %v", sid, err)
-		return
+	{
+		_, sbLookupSpan := otel.Tracer("").Start(ctx, "daemon.releaseNetwork.sandboxLookup")
+		sb, err := daemon.netController.SandboxByID(sid)
+		sbLookupSpan.End()
+		if err != nil {
+			log.G(ctx).Warnf("error locating sandbox id %s: %v", sid, err)
+			return
+		}
+
+		_, sbDeleteSpan := otel.Tracer("").Start(ctx, "daemon.releaseNetwork.sandboxDelete")
+		if err := sb.Delete(ctx); err != nil {
+			log.G(ctx).Errorf("Error deleting sandbox id %s for container %s: %v", sid, ctr.ID, err)
+		}
+		sbDeleteSpan.End()
 	}
 
-	if err := sb.Delete(ctx); err != nil {
-		log.G(ctx).Errorf("Error deleting sandbox id %s for container %s: %v", sid, ctr.ID, err)
-	}
-
-	for _, nw := range networks {
-		daemon.tryDetachContainerFromClusterNetwork(nw, ctr)
+	{
+		_, detachSpan := otel.Tracer("").Start(ctx, "daemon.releaseNetwork.detachClusterNetworks")
+		for _, nw := range networks {
+			daemon.tryDetachContainerFromClusterNetwork(nw, ctr)
+		}
+		detachSpan.End()
 	}
 	metrics.NetworkActions.WithValues("release").UpdateSince(start)
 }

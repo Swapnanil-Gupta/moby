@@ -268,44 +268,77 @@ func (daemon *Daemon) containerStart(ctx context.Context, daemonCfg *configStore
 // Cleanup releases any network resources allocated to the container along with any rules
 // around how containers are linked together.  It also unmounts the container's root filesystem.
 func (daemon *Daemon) Cleanup(ctx context.Context, container *container.Container) {
+	_, span := otel.Tracer("").Start(ctx, "daemon.Cleanup", trace.WithAttributes(
+		attribute.String("container.ID", container.ID),
+	))
+	defer span.End()
+
 	// Microsoft HCS containers get in a bad state if host resources are
 	// released while the container still exists.
 	if ctr, ok := container.State.C8dContainer(); ok {
+		_, ctrDelSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.deleteC8dContainer")
 		if err := ctr.Delete(context.Background()); err != nil {
 			log.G(ctx).Errorf("%s cleanup: failed to delete container from containerd: %v", container.ID, err)
 		}
+		ctrDelSpan.End()
 	}
 
-	daemon.releaseNetwork(ctx, container)
-
-	if err := container.UnmountIpcMount(); err != nil {
-		log.G(ctx).Warnf("%s cleanup: failed to unmount IPC: %s", container.ID, err)
+	{
+		_, netSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.releaseNetwork")
+		daemon.releaseNetwork(ctx, container)
+		netSpan.End()
 	}
 
-	if err := daemon.conditionalUnmountOnCleanup(container); err != nil {
-		// FIXME: remove once reference counting for graphdrivers has been refactored
-		// Ensure that all the mounts are gone
-		if mountid, err := daemon.imageService.GetLayerMountID(container.ID); err == nil {
-			daemon.cleanupMountsByID(mountid)
+	{
+		_, ipcSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.unmountIPC")
+		if err := container.UnmountIpcMount(); err != nil {
+			log.G(ctx).Warnf("%s cleanup: failed to unmount IPC: %s", container.ID, err)
 		}
+		ipcSpan.End()
 	}
 
-	if err := container.UnmountSecrets(); err != nil {
-		log.G(ctx).Warnf("%s cleanup: failed to unmount secrets: %s", container.ID, err)
+	{
+		_, unmountSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.conditionalUnmount")
+		if err := daemon.conditionalUnmountOnCleanup(container); err != nil {
+			// FIXME: remove once reference counting for graphdrivers has been refactored
+			// Ensure that all the mounts are gone
+			if mountid, err := daemon.imageService.GetLayerMountID(container.ID); err == nil {
+				daemon.cleanupMountsByID(mountid)
+			}
+		}
+		unmountSpan.End()
 	}
 
-	if err := recursiveUnmount(container.Root); err != nil {
-		log.G(ctx).WithError(err).WithField("container", container.ID).Warn("Error while cleaning up container resource mounts.")
+	{
+		_, secretsSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.unmountSecrets")
+		if err := container.UnmountSecrets(); err != nil {
+			log.G(ctx).Warnf("%s cleanup: failed to unmount secrets: %s", container.ID, err)
+		}
+		secretsSpan.End()
 	}
 
-	for _, eConfig := range container.ExecCommands.Commands() {
-		daemon.unregisterExecCommand(container, eConfig)
+	{
+		_, recurseSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.recursiveUnmount")
+		if err := recursiveUnmount(container.Root); err != nil {
+			log.G(ctx).WithError(err).WithField("container", container.ID).Warn("Error while cleaning up container resource mounts.")
+		}
+		recurseSpan.End()
+	}
+
+	{
+		_, execSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.unregisterExecCommands")
+		for _, eConfig := range container.ExecCommands.Commands() {
+			daemon.unregisterExecCommand(container, eConfig)
+		}
+		execSpan.End()
 	}
 
 	if container.BaseFS != "" {
+		_, volSpan := otel.Tracer("").Start(ctx, "daemon.Cleanup.unmountVolumes")
 		if err := container.UnmountVolumes(ctx, daemon.LogVolumeEvent); err != nil {
 			log.G(ctx).Warnf("%s cleanup: Failed to umount volumes: %v", container.ID, err)
 		}
+		volSpan.End()
 	}
 
 	container.CancelAttachContext()

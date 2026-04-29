@@ -18,6 +18,9 @@ import (
 	"github.com/moby/moby/v2/daemon/internal/restartmanager"
 	"github.com/moby/moby/v2/daemon/server/backend"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func (daemon *Daemon) setStateCounter(c *container.Container) {
@@ -32,8 +35,14 @@ func (daemon *Daemon) setStateCounter(c *container.Container) {
 }
 
 func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontainerdtypes.EventInfo) error {
+	ctx, span := otel.Tracer("").Start(context.Background(), "daemon.handleContainerExit", trace.WithAttributes(
+		attribute.String("container.ID", c.ID),
+	))
+	defer span.End()
+
 	var ctrExitStatus container.ExitStatus
 	c.Lock()
+	span.AddEvent("container.lock.acquired")
 
 	// If the latest container error is related to networking setup, don't try
 	// to restart the container, and don't change the container state to
@@ -45,30 +54,44 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 	// error type (because this field is persisted on disk). So, use string
 	// matching instead of usual error comparison methods.
 	if strings.Contains(c.State.ErrorMsg, errSetupNetworking) {
+		span.AddEvent("exit.skipped.networking_error")
 		c.Unlock()
 		return nil
 	}
 
 	// Ignore duplicate exit event that may arrive after the first one.
 	// See moby/moby#46212.
-	if daemon.shouldIgnoreExitEventWithLock(c, e) {
-		c.Unlock()
-		return nil
+	{
+		_, ignoreSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.shouldIgnoreExitEvent")
+		ignored := daemon.shouldIgnoreExitEventWithLock(c, e)
+		ignoreSpan.End()
+		if ignored {
+			span.AddEvent("exit.skipped.duplicate")
+			c.Unlock()
+			return nil
+		}
 	}
 
 	cfg := daemon.config()
 
 	// Health checks will be automatically restarted if/when the
 	// container is started again.
-	daemon.stopHealthchecks(c)
+	{
+		_, healthSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.stopHealthchecks")
+		daemon.stopHealthchecks(c)
+		healthSpan.End()
+	}
 
 	tsk, ok := c.State.Task()
 	if ok {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		es, err := tsk.Delete(ctx)
+		_, taskDeleteSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.taskDelete")
+		taskDeleteCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		es, err := tsk.Delete(taskDeleteCtx)
 		cancel()
+		taskDeleteSpan.SetAttributes(attribute.Bool("error", err != nil))
+		taskDeleteSpan.End()
 		if err != nil {
-			log.G(ctx).WithFields(log.Fields{
+			log.G(taskDeleteCtx).WithFields(log.Fields{
 				"error":     err,
 				"container": c.ID,
 			}).Warn("failed to delete container from containerd")
@@ -80,11 +103,19 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	c.StreamConfig.Wait(ctx)
-	cancel()
+	{
+		_, streamSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.streamWait")
+		streamCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		c.StreamConfig.Wait(streamCtx)
+		cancel()
+		streamSpan.End()
+	}
 
-	c.Reset()
+	{
+		_, resetSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.containerReset")
+		c.Reset()
+		resetSpan.End()
+	}
 
 	if e != nil {
 		ctrExitStatus.ExitCode = int(e.ExitCode)
@@ -96,30 +127,46 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 
 	daemonShutdown := daemon.IsShuttingDown()
 	execDuration := time.Since(c.State.StartedAt)
-	restart, wait, err := c.RestartManager().ShouldRestart(uint32(ctrExitStatus.ExitCode), daemonShutdown || c.HasBeenManuallyStopped, execDuration)
-	if err != nil {
-		// Ignore ErrRestartCanceled errors, which mean the restart-manager
-		// was stopped (e.g., during daemon shutdown).
-		if !errors.Is(err, restartmanager.ErrRestartCanceled) {
-			log.G(ctx).WithFields(log.Fields{
-				"error":                  err,
-				"container":              c.ID,
-				"restartCount":           c.RestartCount,
-				"exitCode":               ctrExitStatus.ExitCode,
-				"exitedAt":               ctrExitStatus.ExitedAt,
-				"daemonShuttingDown":     daemonShutdown,
-				"hasBeenManuallyStopped": c.HasBeenManuallyStopped,
-				"execDuration":           execDuration,
-			}).Warn("ShouldRestart failed: container will not be restarted")
+
+	var restart bool
+	var wait <-chan error
+	{
+		_, restartSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.shouldRestart")
+		var err error
+		restart, wait, err = c.RestartManager().ShouldRestart(uint32(ctrExitStatus.ExitCode), daemonShutdown || c.HasBeenManuallyStopped, execDuration)
+		restartSpan.SetAttributes(attribute.Bool("restart", restart))
+		restartSpan.End()
+		if err != nil {
+			// Ignore ErrRestartCanceled errors, which mean the restart-manager
+			// was stopped (e.g., during daemon shutdown).
+			if !errors.Is(err, restartmanager.ErrRestartCanceled) {
+				log.G(ctx).WithFields(log.Fields{
+					"error":                  err,
+					"container":              c.ID,
+					"restartCount":           c.RestartCount,
+					"exitCode":               ctrExitStatus.ExitCode,
+					"exitedAt":               ctrExitStatus.ExitedAt,
+					"daemonShuttingDown":     daemonShutdown,
+					"hasBeenManuallyStopped": c.HasBeenManuallyStopped,
+					"execDuration":           execDuration,
+				}).Warn("ShouldRestart failed: container will not be restarted")
+			}
+			restart = false
 		}
-		restart = false
 	}
 
 	attributes := map[string]string{
 		"exitCode":     strconv.Itoa(ctrExitStatus.ExitCode),
 		"execDuration": strconv.Itoa(int(execDuration.Seconds())),
 	}
-	daemon.Cleanup(context.TODO(), c)
+
+	{
+		_, cleanupSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.cleanup")
+		daemon.Cleanup(ctx, c)
+		cleanupSpan.End()
+	}
+
+	var checkpointErr error
 
 	if restart {
 		c.RestartCount++
@@ -133,7 +180,9 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 		}).Info("restarting container")
 		c.State.SetRestarting(&ctrExitStatus)
 	} else {
+		span.AddEvent("state.setStopped.before")
 		c.State.SetStopped(&ctrExitStatus)
+		span.AddEvent("state.setStopped.after")
 		if !c.HasBeenManuallyRestarted {
 			defer daemon.autoRemove(&cfg.Config, c)
 		}
@@ -141,9 +190,18 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 	defer c.Unlock() // needs to be called before autoRemove
 
 	daemon.setStateCounter(c)
-	checkpointErr := c.CheckpointTo(context.TODO(), daemon.containersReplica)
 
-	daemon.LogContainerEventWithAttributes(c, events.ActionDie, attributes)
+	{
+		_, cpSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.checkpointTo")
+		checkpointErr = c.CheckpointTo(ctx, daemon.containersReplica)
+		cpSpan.End()
+	}
+
+	{
+		_, logSpan := otel.Tracer("").Start(ctx, "daemon.handleContainerExit.logEvent")
+		daemon.LogContainerEventWithAttributes(c, events.ActionDie, attributes)
+		logSpan.End()
+	}
 
 	if restart {
 		go func() {
@@ -181,6 +239,11 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 
 // ProcessEvent is called by libcontainerd whenever an event occurs
 func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei libcontainerdtypes.EventInfo) error {
+	_, procSpan := otel.Tracer("").Start(context.Background(), "daemon.ProcessEvent", trace.WithAttributes(
+		attribute.String("container.ID", id),
+		attribute.String("event.type", string(e)),
+	))
+	defer procSpan.End()
 	c, err := daemon.GetContainer(id)
 	if err != nil {
 		return errors.Wrapf(err, "could not find container %s", id)
